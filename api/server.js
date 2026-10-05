@@ -1,10 +1,11 @@
 import express from "express";
+import { DatabaseSync } from "node:sqlite";
 
 const app = express();
 const FHIR = "http://localhost:8080/fhir";
+const db = new DatabaseSync("directory.db");
 
-// INTENTIONALLY VULNERABLE (v1): no authentication, no ownership check.
-// Any caller can read any patient just by changing the ID in the URL.
+// INTENTIONALLY VULNERABLE (v1): no authentication, no ownership check (IDOR).
 app.get("/api/patients/:id", async (req, res) => {
   try {
     const response = await fetch(`${FHIR}/Patient/${req.params.id}`);
@@ -12,6 +13,22 @@ app.get("/api/patients/:id", async (req, res) => {
     res.status(response.status).json(data);
   } catch (err) {
     res.status(502).json({ error: "FHIR server unreachable" });
+  }
+});
+
+// INTENTIONALLY VULNERABLE (v1): SQL injection.
+// User input is concatenated straight into the query string,
+// and the error response leaks the query and database error.
+app.get("/api/search", (req, res) => {
+  const name = req.query.name || "";
+  const sql =
+    "SELECT fhir_id, full_name, postcode FROM patient_directory " +
+    "WHERE full_name LIKE '%" + name + "%'";
+  try {
+    const rows = db.prepare(sql).all();
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message, query: sql });
   }
 });
 
