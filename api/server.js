@@ -1,9 +1,13 @@
 import express from "express";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+import fs from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 
 const app = express();
 app.disable("x-powered-by");
+app.use(helmet()); // security headers: CSP, nosniff, frame protection, etc.
 app.use(express.json({ limit: "10kb" }));
 
 const FHIR = "http://localhost:8080/fhir";
@@ -17,7 +21,49 @@ db.exec(`CREATE TABLE IF NOT EXISTS notes (
   patient_id TEXT, author TEXT, body TEXT
 )`);
 
-// AUTHENTICATION: verify the signature, issuer, audience and expiry of the JWT.
+// AUDIT LOG: one JSON line per API request. It records who, what, when and the
+// outcome. It never records tokens, query strings or note text, because those
+// can contain sensitive data.
+const AUDIT_FILE = "audit.log";
+function audit(entry) {
+  fs.appendFileSync(
+    AUDIT_FILE,
+    JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n"
+  );
+}
+
+app.use("/api", (req, res, next) => {
+  res.on("finish", () => {
+    const s = res.statusCode;
+    audit({
+      event:
+        s === 401 || s === 403 ? "access_denied" : s === 429 ? "rate_limited" : "api_request",
+      user: req.user?.preferred_username ?? null,
+      sub: req.user?.sub ?? null,
+      patient_context: req.user?.patient_id ?? null,
+      ip: req.ip,
+      method: req.method,
+      path: req.originalUrl.split("?")[0].slice(0, 200),
+      status: s,
+    });
+  });
+  next();
+});
+
+// RATE LIMITING: applied before authentication so unauthenticated floods are
+// throttled too. State is in memory and resets on restart.
+app.use(
+  "/api",
+  rateLimit({
+    windowMs: 60 * 1000,
+    limit: 100,
+    standardHeaders: "draft-7",
+    legacyHeaders: false,
+    message: { error: "Too many requests" },
+  })
+);
+
+// AUTHENTICATION: verify signature, issuer, audience and expiry of the JWT.
 async function requireAuth(req, res, next) {
   const [scheme, token] = (req.headers.authorization || "").split(" ");
   if (scheme !== "Bearer" || !token) {
@@ -39,7 +85,7 @@ async function requireAuth(req, res, next) {
   }
 }
 
-// AUTHORISATION (the IDOR fix): a patient may only access their own record.
+// AUTHORISATION: a patient may only access their own record.
 function ownPatientOnly(req, res, next) {
   if (req.params.id !== req.user.patient_id) {
     return res.status(403).json({ error: "Forbidden" });
@@ -49,7 +95,6 @@ function ownPatientOnly(req, res, next) {
 
 app.use("/api", requireAuth);
 
-// Returns only the caller's own record, taken from the token, not from the URL.
 app.get("/api/patients", async (req, res) => {
   try {
     const r = await fetch(`${FHIR}/Patient/${encodeURIComponent(req.user.patient_id)}`);
@@ -78,7 +123,6 @@ app.get("/api/patients/:id", ownPatientOnly, async (req, res) => {
   }
 });
 
-// Parameterised query, limited to the caller's own directory entry.
 app.get("/api/search", (req, res) => {
   const name = String(req.query.name || "").slice(0, 100);
   try {
@@ -101,7 +145,6 @@ app.get("/api/patients/:id/notes", ownPatientOnly, (req, res) => {
   );
 });
 
-// The author comes from the verified token, so callers cannot impersonate anyone.
 app.post("/api/patients/:id/notes", ownPatientOnly, (req, res) => {
   const body = req.body?.body;
   if (typeof body !== "string" || body.length === 0 || body.length > 2000) {
@@ -114,5 +157,5 @@ app.post("/api/patients/:id/notes", ownPatientOnly, (req, res) => {
 });
 
 app.listen(3000, "127.0.0.1", () => {
-  console.log("API listening on http://localhost:3000 (JWT auth + per-patient authorisation)");
+  console.log("API listening on http://localhost:3000 (JWT auth, authorisation, helmet, rate limit, audit log)");
 });
